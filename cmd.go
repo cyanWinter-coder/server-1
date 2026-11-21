@@ -7,6 +7,7 @@ package server
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"strconv"
 	"strings"
@@ -111,15 +112,22 @@ func (cmd commandAppe) RequireAuth() bool {
 
 func (cmd commandAppe) Execute(conn *Conn, param string) {
 	targetPath := conn.buildPath(param)
-	conn.writeMessage(150, "Data transfer starting")
+	t, err := conn.beginTransfer()
+	if err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 
-	bytes, err := conn.driver.PutFile(targetPath, conn.dataConn, true)
-	if err == nil {
+	conn.writeMessage(150, "Data transfer starting")
+	conn.runTransfer(t, func() error {
+		bytes, err := conn.uploadTransfer(t, targetPath, true)
+		if err != nil {
+			return err
+		}
 		msg := "OK, received " + strconv.Itoa(int(bytes)) + " bytes"
 		conn.writeMessage(226, msg)
-	} else {
-		conn.writeMessage(450, fmt.Sprint("error during transfer: ", err))
-	}
+		return nil
+	})
 }
 
 type commandOpts struct{}
@@ -278,6 +286,10 @@ func (cmd commandEprt) RequireAuth() bool {
 }
 
 func (cmd commandEprt) Execute(conn *Conn, param string) {
+	if err := conn.dataConnectionAllowed(); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	delim := string(param[0:1])
 	parts := strings.Split(param, delim)
 	addressFamily, err := strconv.Atoi(parts[1])
@@ -292,7 +304,10 @@ func (cmd commandEprt) Execute(conn *Conn, param string) {
 		conn.writeMessage(425, "Data connection failed")
 		return
 	}
-	conn.dataConn = socket
+	if err := conn.setDataConn(socket); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	conn.writeMessage(200, "Connection established ("+strconv.Itoa(port)+")")
 }
 
@@ -315,6 +330,10 @@ func (cmd commandLprt) RequireAuth() bool {
 
 func (cmd commandLprt) Execute(conn *Conn, param string) {
 	// No tests for this code yet
+	if err := conn.dataConnectionAllowed(); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 
 	parts := strings.Split(param, ",")
 
@@ -346,7 +365,7 @@ func (cmd commandLprt) Execute(conn *Conn, param string) {
 	port := int(binary.BigEndian.Uint16(portBytes))
 
 	// if the existing connection is on the same host/port don't reconnect
-	if conn.dataConn.Host() == host && conn.dataConn.Port() == port {
+	if conn.pendingDataMatches(host, port) {
 		return
 	}
 
@@ -355,7 +374,10 @@ func (cmd commandLprt) Execute(conn *Conn, param string) {
 		conn.writeMessage(425, "Data connection failed")
 		return
 	}
-	conn.dataConn = socket
+	if err := conn.setDataConn(socket); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	conn.writeMessage(200, "Connection established ("+strconv.Itoa(port)+")")
 }
 
@@ -377,6 +399,10 @@ func (cmd commandEpsv) RequireAuth() bool {
 }
 
 func (cmd commandEpsv) Execute(conn *Conn, param string) {
+	if err := conn.dataConnectionAllowed(); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	addr := conn.passiveListenIP()
 	socket, err := newPassiveSocket(addr, conn.PassivePort, conn.logger, conn.sessionID, conn.tlsConfig)
 	if err != nil {
@@ -384,7 +410,10 @@ func (cmd commandEpsv) Execute(conn *Conn, param string) {
 		conn.writeMessage(425, "Data connection failed")
 		return
 	}
-	conn.dataConn = socket
+	if err := conn.setDataConn(socket); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	msg := fmt.Sprintf("Entering Extended Passive Mode (|||%d|)", socket.Port())
 	conn.writeMessage(229, msg)
 }
@@ -431,8 +460,13 @@ func (cmd commandList) Execute(conn *Conn, param string) {
 		files = append(files, info)
 	}
 
+	t, err := conn.beginTransfer()
+	if err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	conn.writeMessage(150, "Opening ASCII mode data connection for file list")
-	conn.sendOutofbandData(listFormatter(files).Detailed())
+	conn.sendOutofbandData(t, listFormatter(files).Detailed())
 }
 
 func parseListParam(param string) (path string) {
@@ -489,8 +523,13 @@ func (cmd commandNlst) Execute(conn *Conn, param string) {
 		conn.writeMessage(550, err.Error())
 		return
 	}
+	t, err := conn.beginTransfer()
+	if err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	conn.writeMessage(150, "Opening ASCII mode data connection for file list")
-	conn.sendOutofbandData(listFormatter(files).Short())
+	conn.sendOutofbandData(t, listFormatter(files).Short())
 }
 
 // commandMdtm responds to the MDTM FTP command. It allows the client to
@@ -646,13 +685,20 @@ func (cmd commandPasv) RequireAuth() bool {
 }
 
 func (cmd commandPasv) Execute(conn *Conn, param string) {
+	if err := conn.dataConnectionAllowed(); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	listenIP := conn.passiveListenIP()
 	socket, err := newPassiveSocket(listenIP, conn.PassivePort, conn.logger, conn.sessionID, conn.tlsConfig)
 	if err != nil {
 		conn.writeMessage(425, "Data connection failed")
 		return
 	}
-	conn.dataConn = socket
+	if err := conn.setDataConn(socket); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	p1 := socket.Port() / 256
 	p2 := socket.Port() - (p1 * 256)
 	quads := strings.Split(listenIP, ".")
@@ -680,6 +726,10 @@ func (cmd commandPort) RequireAuth() bool {
 }
 
 func (cmd commandPort) Execute(conn *Conn, param string) {
+	if err := conn.dataConnectionAllowed(); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	nums := strings.Split(param, ",")
 	portOne, _ := strconv.Atoi(nums[4])
 	portTwo, _ := strconv.Atoi(nums[5])
@@ -690,7 +740,10 @@ func (cmd commandPort) Execute(conn *Conn, param string) {
 		conn.writeMessage(425, "Data connection failed")
 		return
 	}
-	conn.dataConn = socket
+	if err := conn.setDataConn(socket); err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
 	conn.writeMessage(200, "Connection established ("+strconv.Itoa(port)+")")
 }
 
@@ -754,18 +807,33 @@ func (cmd commandRetr) RequireAuth() bool {
 
 func (cmd commandRetr) Execute(conn *Conn, param string) {
 	path := conn.buildPath(param)
+	filePos := conn.lastFilePos
 	defer func() {
 		conn.lastFilePos = 0
 		conn.appendData = false
 	}()
-	bytes, data, err := conn.driver.GetFile(path, conn.lastFilePos)
+	bytes, data, err := conn.driver.GetFile(path, filePos)
 	if err == nil {
 		defer data.Close()
-		conn.writeMessage(150, fmt.Sprintf("Data transfer starting %v bytes", bytes))
-		err = conn.sendOutofBandDataWriter(data)
-		if err != nil {
-			conn.writeMessage(551, "Error reading file")
+		t, terr := conn.beginTransfer()
+		if terr != nil {
+			conn.writeMessage(425, transferErrorText(terr))
+			return
 		}
+		conn.writeMessage(150, fmt.Sprintf("Data transfer starting %v bytes", bytes))
+		conn.runTransfer(t, func() error {
+			written, err := io.Copy(t.data, data)
+			if err != nil {
+				if t.isCancelled() {
+					return err
+				}
+				conn.writeMessage(551, "Error reading file")
+				return nil
+			}
+			message := "Closing data connection, sent " + strconv.Itoa(int(written)) + " bytes"
+			conn.writeMessage(226, message)
+			return nil
+		})
 	} else {
 		conn.writeMessage(551, "File not available")
 	}
@@ -1082,19 +1150,27 @@ func (cmd commandStor) RequireAuth() bool {
 
 func (cmd commandStor) Execute(conn *Conn, param string) {
 	targetPath := conn.buildPath(param)
-	conn.writeMessage(150, "Data transfer starting")
-
+	appendData := conn.appendData
 	defer func() {
 		conn.appendData = false
 	}()
 
-	bytes, err := conn.driver.PutFile(targetPath, conn.dataConn, conn.appendData)
-	if err == nil {
+	t, err := conn.beginTransfer()
+	if err != nil {
+		conn.writeMessage(425, transferErrorText(err))
+		return
+	}
+
+	conn.writeMessage(150, "Data transfer starting")
+	conn.runTransfer(t, func() error {
+		bytes, err := conn.uploadTransfer(t, targetPath, appendData)
+		if err != nil {
+			return err
+		}
 		msg := "OK, received " + strconv.Itoa(int(bytes)) + " bytes"
 		conn.writeMessage(226, msg)
-	} else {
-		conn.writeMessage(450, fmt.Sprint("error during transfer: ", err))
-	}
+		return nil
+	})
 }
 
 // commandStru responds to the STRU FTP command.
@@ -1149,14 +1225,14 @@ func (cmd commandSyst) Execute(conn *Conn, param string) {
 
 // commandType responds to the TYPE FTP command.
 //
-//  like the MODE and STRU commands, TYPE dates back to a time when the FTP
-//  protocol was more aware of the content of the files it was transferring, and
-//  would sometimes be expected to translate things like EOL markers on the fly.
+//	like the MODE and STRU commands, TYPE dates back to a time when the FTP
+//	protocol was more aware of the content of the files it was transferring, and
+//	would sometimes be expected to translate things like EOL markers on the fly.
 //
-//  Valid options were A(SCII), I(mage), E(BCDIC) or LN (for local type). Since
-//  we plan to just accept bytes from the client unchanged, I think Image mode is
-//  adequate. The RFC requires we accept ASCII mode however, so accept it, but
-//  ignore it.
+//	Valid options were A(SCII), I(mage), E(BCDIC) or LN (for local type). Since
+//	we plan to just accept bytes from the client unchanged, I think Image mode is
+//	adequate. The RFC requires we accept ASCII mode however, so accept it, but
+//	ignore it.
 type commandType struct{}
 
 func (cmd commandType) IsExtend() bool {

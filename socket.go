@@ -6,6 +6,7 @@ package server
 
 import (
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -16,6 +17,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// errDataSocketClosed is returned by a data socket once it has been closed,
+// either because the transfer completed or because the session went away.
+var errDataSocketClosed = errors.New("ftp: data connection closed")
 
 // DataSocket describes a data socket is used to send non-control data between the client and
 // server.
@@ -38,10 +43,11 @@ type DataSocket interface {
 }
 
 type ftpActiveSocket struct {
-	conn   *net.TCPConn
-	host   string
-	port   int
-	logger Logger
+	conn      *net.TCPConn
+	host      string
+	port      int
+	logger    Logger
+	closeOnce sync.Once
 }
 
 func newActiveSocket(remote string, port int, logger Logger, sessionID string) (DataSocket, error) {
@@ -93,18 +99,25 @@ func (socket *ftpActiveSocket) Write(p []byte) (n int, err error) {
 }
 
 func (socket *ftpActiveSocket) Close() error {
-	return socket.conn.Close()
+	var err error
+	socket.closeOnce.Do(func() {
+		err = socket.conn.Close()
+	})
+	return err
 }
 
 type ftpPassiveSocket struct {
 	conn      net.Conn
+	listener  net.Listener
 	port      int
 	host      string
-	ingress   chan []byte
-	egress    chan []byte
 	logger    Logger
-	lock      sync.Mutex // protects conn and err
+	lock      sync.Mutex // protects conn, listener, err and closed
 	err       error
+	closed    bool
+	ready     chan struct{}
+	readyOnce sync.Once
+	closeOnce sync.Once
 	tlsConfig *tls.Config
 }
 
@@ -136,8 +149,7 @@ func isErrorAddressAlreadyInUse(err error) bool {
 
 func newPassiveSocket(host string, port func() int, logger Logger, sessionID string, tlsConfig *tls.Config) (DataSocket, error) {
 	socket := new(ftpPassiveSocket)
-	socket.ingress = make(chan []byte)
-	socket.egress = make(chan []byte)
+	socket.ready = make(chan struct{})
 	socket.logger = logger
 	socket.host = host
 	socket.tlsConfig = tlsConfig
@@ -152,7 +164,11 @@ func newPassiveSocket(host string, port func() int, logger Logger, sessionID str
 		}
 		break
 	}
-	return socket, err
+	if err != nil {
+		socket.Close()
+		return nil, err
+	}
+	return socket, nil
 }
 
 func (socket *ftpPassiveSocket) Host() string {
@@ -160,46 +176,98 @@ func (socket *ftpPassiveSocket) Host() string {
 }
 
 func (socket *ftpPassiveSocket) Port() int {
+	socket.lock.Lock()
+	defer socket.lock.Unlock()
 	return socket.port
 }
 
-func (socket *ftpPassiveSocket) Read(p []byte) (n int, err error) {
+// wait blocks until the client has connected to the passive listener (or the
+// socket was closed / the accept timed out).
+func (socket *ftpPassiveSocket) wait() error {
+	<-socket.ready
 	socket.lock.Lock()
 	defer socket.lock.Unlock()
-	if socket.err != nil {
-		return 0, socket.err
+	if socket.closed {
+		return errDataSocketClosed
 	}
-	return socket.conn.Read(p)
+	if socket.err != nil {
+		return socket.err
+	}
+	return nil
+}
+
+func (socket *ftpPassiveSocket) Read(p []byte) (n int, err error) {
+	if err := socket.wait(); err != nil {
+		return 0, err
+	}
+	socket.lock.Lock()
+	conn := socket.conn
+	socket.lock.Unlock()
+	if conn == nil {
+		return 0, errDataSocketClosed
+	}
+	// The lock is not held during the read: Close closes the connection to
+	// unblock a read that is still in flight.
+	return conn.Read(p)
 }
 
 func (socket *ftpPassiveSocket) ReadFrom(r io.Reader) (int64, error) {
+	if err := socket.wait(); err != nil {
+		return 0, err
+	}
 	socket.lock.Lock()
-	defer socket.lock.Unlock()
-	if socket.err != nil {
-		return 0, socket.err
+	conn := socket.conn
+	socket.lock.Unlock()
+	if conn == nil {
+		return 0, errDataSocketClosed
 	}
 
 	// For normal TCPConn, this will use sendfile syscall; if not,
 	// it will just downgrade to normal read/write procedure
-	return io.Copy(socket.conn, r)
+	return io.Copy(conn, r)
 }
 
 func (socket *ftpPassiveSocket) Write(p []byte) (n int, err error) {
-	socket.lock.Lock()
-	defer socket.lock.Unlock()
-	if socket.err != nil {
-		return 0, socket.err
+	if err := socket.wait(); err != nil {
+		return 0, err
 	}
-	return socket.conn.Write(p)
+	socket.lock.Lock()
+	conn := socket.conn
+	socket.lock.Unlock()
+	if conn == nil {
+		return 0, errDataSocketClosed
+	}
+	return conn.Write(p)
 }
 
+// Close stops the passive listener and closes the accepted connection, if any.
+// It is safe to call repeatedly and from any goroutine; in particular it never
+// waits for the accept timeout to expire.
 func (socket *ftpPassiveSocket) Close() error {
-	socket.lock.Lock()
-	defer socket.lock.Unlock()
-	if socket.conn != nil {
-		return socket.conn.Close()
-	}
-	return nil
+	var err error
+	socket.closeOnce.Do(func() {
+		socket.lock.Lock()
+		socket.closed = true
+		listener := socket.listener
+		conn := socket.conn
+		socket.conn = nil
+		socket.lock.Unlock()
+
+		if listener != nil {
+			if cerr := listener.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+		if conn != nil {
+			if cerr := conn.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+		// Unblock any reader waiting for the client to connect. The accept
+		// goroutine also closes ready when the listener goes away.
+		socket.readyOnce.Do(func() { close(socket.ready) })
+	})
+	return err
 }
 
 func (socket *ftpPassiveSocket) GoListenAndServe(sessionID string) (err error) {
@@ -222,6 +290,7 @@ func (socket *ftpPassiveSocket) GoListenAndServe(sessionID string) (err error) {
 	err = tcplistener.SetDeadline(time.Now().Add(acceptTimeout))
 	if err != nil {
 		socket.logger.Print(sessionID, err)
+		tcplistener.Close()
 		return
 	}
 
@@ -231,26 +300,56 @@ func (socket *ftpPassiveSocket) GoListenAndServe(sessionID string) (err error) {
 	port, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
 		socket.logger.Print(sessionID, err)
+		listener.Close()
 		return
 	}
 
-	socket.port = port
 	if socket.tlsConfig != nil {
 		listener = tls.NewListener(listener, socket.tlsConfig)
 	}
 
 	socket.lock.Lock()
-	go func() {
-		defer socket.lock.Unlock()
+	if socket.closed {
+		socket.lock.Unlock()
+		listener.Close()
+		return errDataSocketClosed
+	}
+	socket.port = port
+	socket.listener = listener
+	socket.lock.Unlock()
 
-		conn, err := listener.Accept()
-		if err != nil {
-			socket.err = err
-			return
-		}
-		socket.err = nil
-		socket.conn = conn
-		_ = listener.Close()
-	}()
+	go socket.accept(listener, sessionID)
 	return nil
+}
+
+func (socket *ftpPassiveSocket) accept(listener net.Listener, sessionID string) {
+	conn, err := listener.Accept()
+	// Only one data connection is accepted per PASV/PORT command; release the
+	// listening port as soon as the client has connected, or as soon as the
+	// accept fails.
+	_ = listener.Close()
+
+	if err != nil {
+		socket.lock.Lock()
+		if socket.closed {
+			err = errDataSocketClosed
+		}
+		socket.err = err
+		socket.lock.Unlock()
+		socket.readyOnce.Do(func() { close(socket.ready) })
+		return
+	}
+
+	socket.lock.Lock()
+	if socket.closed {
+		socket.lock.Unlock()
+		conn.Close()
+		socket.readyOnce.Do(func() { close(socket.ready) })
+		return
+	}
+	socket.conn = conn
+	socket.err = nil
+	socket.listener = nil
+	socket.lock.Unlock()
+	socket.readyOnce.Do(func() { close(socket.ready) })
 }
